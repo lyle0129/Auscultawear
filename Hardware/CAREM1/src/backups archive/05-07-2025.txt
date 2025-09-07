@@ -1,0 +1,793 @@
+/*
+Last Working Edit: 07/05/2025
+======================== Care Research Group M1 ========================================
+Auscultawear: A Wearable Audio Based Monitoring Platform for Heart and Respiratory Rates
+
+Trillanes, dela Cruz, Manalili
+
+This is the combined code for the:
+
+1. Microphone - making use of an electret microphone (Max 4466 breakout board)
+ - implemented with an ADC 
+2. IMU - making use of the on-board IMU within Seeed Studio Xiao NRF52840 Sense (LSMDSL)
+ - communicating via internal I2C of the seeed
+3. MicroSD card - communicating via SPI communication protocol
+ - temporarily commented out for the use case of Mr. Manalili
+4. BLE - implemented using the internal UART, set to MTU = 247
+ - built upon BLE Nordic Uart Service  
+
+*/
+
+#include <zephyr/kernel.h>
+#include <zephyr/audio/dmic.h>
+#include <zephyr/logging/log.h>
+#include <zephyr/bluetooth/bluetooth.h>
+#include <zephyr/bluetooth/services/nus.h>
+#include <zephyr/drivers/gpio.h>
+#include <zephyr/device.h>
+#include <zephyr/drivers/spi.h>
+#include <zephyr/fs/fs.h>
+#include <zephyr/storage/disk_access.h>
+#include <ff.h>
+#include <zephyr/drivers/sensor.h>
+#include <stdio.h>
+#include <zephyr/sys/util.h>
+#include <math.h>
+#include <zephyr/devicetree.h>
+#include <zephyr/drivers/adc.h>
+#include <zephyr/sys/printk.h>
+#include <stdio.h>
+#include <zephyr/sys/time_units.h>
+
+/*---------------------------------------------- SD card essentials ----------------------------------------------- */
+// #define SPI_DEVICE_NODE DT_NODELABEL(spi2)
+// #define SD_CS_PIN 28  // Chip Select pin for SD card, chosen as P0.28
+// const struct device *cs = DEVICE_DT_GET(DT_NODELABEL(gpio0));
+
+// static const struct device *spi_dev;
+
+// #define SD_CARD_MOUNT_POINT "/SD:"
+// #define LOG_FILENAME "audio.txt" // Observation: we can't make the file name so long
+
+// static FATFS fat_fs;
+// static struct fs_mount_t mp = {
+//         .type = FS_FATFS,
+//         .mnt_point = SD_CARD_MOUNT_POINT,
+// };
+/* -------------------------------------------------------------------------------------------------------------------------  */
+
+/* ---------------------------------------------- LED Setup ---------------------------------------------- */
+#define RED_LED_NODE DT_ALIAS(led0)
+#define GREEN_LED_NODE DT_ALIAS(led1)
+#define BLUE_LED_NODE DT_ALIAS(led2)
+
+static const struct gpio_dt_spec red_led = GPIO_DT_SPEC_GET(RED_LED_NODE, gpios);
+static const struct gpio_dt_spec green_led = GPIO_DT_SPEC_GET(GREEN_LED_NODE, gpios);
+static const struct gpio_dt_spec blue_led = GPIO_DT_SPEC_GET(BLUE_LED_NODE, gpios);
+
+void led_on(const struct gpio_dt_spec *led)
+{
+    gpio_pin_set_dt(led, 1);
+}
+
+void led_off(const struct gpio_dt_spec *led)
+{
+    gpio_pin_set_dt(led, 0);
+}
+
+/* ------------------------------------------------------------------------------------------------------------------------- */
+
+LOG_MODULE_REGISTER(Auscultawear);
+
+/* ---------------------------------------------- BLE NUS Variables ---------------------------------------------- */
+#define DEVICE_NAME     CONFIG_BT_DEVICE_NAME //change this in prj.conf -- "CARE_M1_chunk" at the moment
+#define DEVICE_NAME_LEN (sizeof(DEVICE_NAME) - 1)
+
+static const struct bt_data ad[] = {
+    BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
+    BT_DATA(BT_DATA_NAME_COMPLETE, DEVICE_NAME, DEVICE_NAME_LEN),
+};
+
+static const struct bt_data sd[] = {
+    BT_DATA_BYTES(BT_DATA_UUID128_ALL, BT_UUID_NUS_SRV_VAL),
+};
+/* ---------------------------------------------- Audio-related Constants ---------------------------------------------- */
+#define ADC_NODE DT_NODELABEL(adc)
+#define ADC_RESOLUTION 12
+#define ADC_MAX_VALUE 4095  // 2^12 - 1 for 12-bit ADC
+#define ADC_REF_VOLTAGE 3.3  // Adjust based on your board's reference -- this is not used because we are not converting back to Voltage
+#define ADC_GAIN ADC_GAIN_1_4
+// #define ADC_REFERENCE ADC_REF_INTERNAL
+#define ADC_REFERENCE ADC_REF_VDD_1_4
+#define ADC_ACQUISITION_TIME ADC_ACQ_TIME_DEFAULT
+#define ADC_CHANNEL_MIC 0  // <-- Channel 0 instead of 2
+
+// Note under edit because wont make use of the onboard mic anymore
+
+// ----- for cont mode ----- //
+static volatile bool cont_mode = false;
+#define CHUNK_SIZE 100  // Each chunk contains 100 samples (200 bytes)
+static int16_t cont_buf[CHUNK_SIZE] = {0};
+static int cont_buf_index = 0;
+// static int16_t chunk_buf[CHUNK_SIZE];  // Global buffer for sending chunks
+
+static volatile size_t last_sent_index = 0;  // Track last sent sample index
+static volatile bool ble_connected = false;  // Track BLE connection status
+
+// For cont sending
+int16_t send_buf[CHUNK_SIZE];  // holds 100 samples before sending via BLE
+size_t chunk_index = 0;        // tracks how many samples have been stored in send_buf
+
+/* ---------------------------------------------- Semaphore mode Flags Settings ----------------------------------------------------------- */
+
+// For setting the semaphore mode flags
+/* Mode Flags */
+enum mode_state {
+    MODE_MANUAL,
+    MODE_AUTO,
+    MODE_CONTINUOUS
+};
+
+/* Global buffer for continuous mode */
+static volatile bool stop_requested = false;  // Flag to handle "stop" command
+
+volatile enum mode_state current_mode = MODE_MANUAL;
+
+/* Semaphore for triggering actions */
+K_SEM_DEFINE(mode_sem, 0, 1);
+
+// ---------------------------------------------------- IMU Implementation -------------------------------------------------------------- //
+#define MIC_RECORD_DURATION_SECONDS 20
+// Note: changing the seconds recording here will change both IMU and MIC Buffers
+/* IMU variables */
+#define STACK_SIZE 2048
+#define IMU_THREAD_PRIORITY 5
+#define MOTION_THRESHOLD 15  // Adjust based on expected motion levels
+#define IMU_SAMPLE_RATE_HZ 100
+// #define IMU_RECORD_DURATION_SECONDS 10 -- will just get the seconds from the MIC_RECORD_DURATION_SECONDS
+#define IMU_SAMPLE_COUNT (IMU_SAMPLE_RATE_HZ * MIC_RECORD_DURATION_SECONDS)
+
+static struct k_thread imu_thread_data;
+K_THREAD_STACK_DEFINE(imu_thread_stack, STACK_SIZE);
+
+static struct sensor_value accel_x_out, accel_y_out, accel_z_out;
+static int motion_flag = 0;
+
+static int16_t imu_buf[IMU_SAMPLE_COUNT] = {0}; // assuming we are using 100 Hz sampling rate
+static volatile size_t IMU_index = 0;
+static volatile bool imu_recording = false;
+
+/* LSM6DSL IMU */
+static const struct device *lsm6dsl_dev = DEVICE_DT_GET_ONE(st_lsm6dsl);
+
+/* For IMU */
+static void lsm6dsl_trigger_handler(const struct device *dev,
+    const struct sensor_trigger *trig)
+{
+    static struct sensor_value accel_x, accel_y, accel_z;
+
+    sensor_sample_fetch_chan(dev, SENSOR_CHAN_ACCEL_XYZ);
+    sensor_channel_get(dev, SENSOR_CHAN_ACCEL_X, &accel_x);
+    sensor_channel_get(dev, SENSOR_CHAN_ACCEL_Y, &accel_y);
+    sensor_channel_get(dev, SENSOR_CHAN_ACCEL_Z, &accel_z);
+
+    accel_x_out = accel_x;
+    accel_y_out = accel_y;
+    accel_z_out = accel_z;
+}
+void imu_thread(void *arg1, void *arg2, void *arg3)
+{
+    struct sensor_trigger trig;
+    struct sensor_value odr_attr;
+
+    if (!device_is_ready(lsm6dsl_dev)) {
+        printk("IMU device not ready.\n");
+        return;
+    }
+
+    /* Set IMU sampling frequency to 104 Hz */
+    odr_attr.val1 = 104;
+    odr_attr.val2 = 0;
+    sensor_attr_set(lsm6dsl_dev, SENSOR_CHAN_ACCEL_XYZ, SENSOR_ATTR_SAMPLING_FREQUENCY, &odr_attr);
+
+    trig.type = SENSOR_TRIG_DATA_READY;
+    trig.chan = SENSOR_CHAN_ACCEL_XYZ;
+
+    if (sensor_trigger_set(lsm6dsl_dev, &trig, lsm6dsl_trigger_handler) != 0) {
+        printk("Could not set IMU sensor trigger\n");
+        return;
+    }
+
+    while (1) {
+        /* Compute motion magnitude */
+        double ax = sensor_value_to_double(&accel_x_out);
+        double ay = sensor_value_to_double(&accel_y_out);
+        double az = sensor_value_to_double(&accel_z_out);
+        double motion_magnitude = sqrt(ax * ax + ay * ay + az * az);
+
+        /* Latch motion_flag once it is triggered */
+        if (motion_magnitude > MOTION_THRESHOLD) {
+            motion_flag = 1;  // Latch motion flag to 1
+        }
+
+        // Storing IMU data to buffer
+        if (IMU_index < IMU_SAMPLE_COUNT && imu_recording == true){
+		imu_buf[IMU_index] = (int16_t)(motion_magnitude * 100);  // For 2 decimal precision
+		IMU_index++;
+	    }
+	    else if (IMU_index == IMU_SAMPLE_COUNT){
+		// printk("IMU buffer Full");
+                imu_recording = false;
+	    }
+        /* Print IMU Data (Optional) */
+        // printk("IMU Motion Magnitude: %.2f | Motion Flag: %d\n", motion_magnitude, motion_flag);
+
+        k_sleep(K_MSEC(10));  // Adjust based on data rate
+    }
+}
+void start_imu_thread(void)
+{
+    k_thread_create(&imu_thread_data, imu_thread_stack,
+                    K_THREAD_STACK_SIZEOF(imu_thread_stack),
+                    imu_thread, NULL, NULL, NULL,
+                    IMU_THREAD_PRIORITY, 0, K_NO_WAIT);
+}
+
+// ------------------------------------------------- Electret Mic Implementation ------------------------------------------------ //
+
+#define MIC_THREAD_STACK_SIZE 1024
+#define MIC_THREAD_PRIORITY 5
+#define MIC_SAMPLE_RATE_HZ 2000
+// #define MIC_RECORD_DURATION_SECONDS 10 -- MOVING THIS AT THE VERY TOP
+#define MIC_SAMPLE_COUNT (MIC_SAMPLE_RATE_HZ * MIC_RECORD_DURATION_SECONDS)
+
+static struct k_thread mic_thread_data;
+K_THREAD_STACK_DEFINE(mic_thread_stack, MIC_THREAD_STACK_SIZE);
+
+static int16_t electret_buf[MIC_SAMPLE_COUNT] = {0};
+static volatile int mic_sample_index = 0;
+static volatile bool mic_recording = false;
+
+static const struct device *adc_dev = DEVICE_DT_GET(ADC_NODE);
+static int16_t adc_sample_buffer[1];
+
+struct adc_channel_cfg adc_channel_mic = {
+    .gain = ADC_GAIN,
+    .reference = ADC_REFERENCE,
+    .acquisition_time = ADC_ACQUISITION_TIME,
+    .channel_id = ADC_CHANNEL_MIC,
+    .input_positive = SAADC_CH_PSELP_PSELP_AnalogInput0,  // AIN0
+};
+
+void mic_thread(void *a, void *b, void *c)
+{
+    if (!device_is_ready(adc_dev)) {
+        printk("ADC device not ready.\n");
+        return;
+    }
+
+    struct adc_sequence sequence = {
+        .channels = BIT(ADC_CHANNEL_MIC),
+        .buffer = adc_sample_buffer,
+        .buffer_size = sizeof(adc_sample_buffer),
+        .resolution = ADC_RESOLUTION,
+    };
+
+    // Open the file before the while (recording) loop:
+    // struct fs_file_t sd_file;
+    // fs_file_t_init(&sd_file);
+    // int err = fs_open(&sd_file, SD_CARD_MOUNT_POINT "/" LOG_FILENAME,
+    //                 FS_O_WRITE | FS_O_CREATE | FS_O_APPEND);
+    // if (err) {
+    //     LOG_ERR("Failed to open SD file: %d", err);
+    //     return err;
+    // }
+
+    while (1) {
+        uint32_t t_start = k_cycle_get_32();
+        if (cont_mode){
+            led_on(&red_led);
+            led_on(&blue_led);
+            led_on(&green_led);
+
+            // We are making use of a special buffer when we are in cont mode
+            if (adc_read(adc_dev, &sequence) == 0) {
+                cont_buf[cont_buf_index++] = adc_sample_buffer[0];
+            } else {
+                cont_buf[cont_buf_index++] = -1;
+                LOG_ERR("ADC read failed at cont sample %d", cont_buf_index - 1);
+            }
+            if (cont_buf_index == CHUNK_SIZE) {
+                int err;
+                do {
+                    err = bt_nus_send(NULL, cont_buf, CHUNK_SIZE * sizeof(int16_t));
+                    if (err == -ENOMEM) {
+                        k_sleep(K_MSEC(10));
+                        LOG_WRN("BLE buffer full, retrying...");
+                    } else if (err == -ENOTCONN) {
+                        LOG_WRN("BLE disconnected during continuous mode.");
+                        cont_mode = false;
+                        break;
+                    } else if (err < 0) {
+                        LOG_ERR("BLE send error: %d", err);
+                        cont_mode = false;
+                        break;
+                    }
+                } while (err == -ENOMEM);
+    
+                cont_buf_index = 0; // Reset buffer index
+            }
+        }
+        else if (mic_recording && mic_sample_index < MIC_SAMPLE_COUNT) {
+            led_on(&red_led);   
+            imu_recording = true;
+            
+
+            if (adc_read(adc_dev, &sequence) == 0) {
+                electret_buf[mic_sample_index] = adc_sample_buffer[0];
+                // 2️⃣ Write to SD card
+                // char line[8];  // enough for "int16 + newline"
+                // int len = snprintk(line, sizeof(line), "%d\n", value);
+                // if (len > 0 && len < sizeof(line)) {
+                //     fs_write(&sd_file, line, len);
+                // }
+            } else {
+                electret_buf[mic_sample_index] = -1;
+                printk("ADC read failed at sample %d\n", mic_sample_index);
+                // 2️⃣ Write to SD card
+                // char line[8];  // enough for "int16 + newline"
+                // int len = snprintk(line, sizeof(line), "%d\n", value);
+                // if (len > 0 && len < sizeof(line)) {
+                //     fs_write(&sd_file, line, len);
+                // }
+            }
+
+            mic_sample_index++;
+
+            if (mic_sample_index >= MIC_SAMPLE_COUNT) {
+                mic_recording = false;
+                led_on(&blue_led);
+                led_off(&red_led);
+                imu_recording = false;
+                printk("Mic recording complete\n");
+            }
+        }
+        uint32_t t_end = k_cycle_get_32();
+        uint32_t elapsed_us = k_cyc_to_us_floor32(t_end - t_start);
+        k_busy_wait(500 - elapsed_us); 
+    }
+}
+
+void start_mic_thread(void)
+{
+    k_thread_create(&mic_thread_data, mic_thread_stack,
+                    K_THREAD_STACK_SIZEOF(mic_thread_stack),
+                    mic_thread, NULL, NULL, NULL,
+                    MIC_THREAD_PRIORITY, 0, K_NO_WAIT);
+}
+
+
+/* ---------------------------------------------- Initializing SD card happens here ---------------------------------------------- */
+// static int init_sd_card(void)
+// {
+//     static const char *disk_pdrv = "SD";
+//     uint64_t memory_size_mb;
+//     uint32_t block_count;
+//     uint32_t block_size;
+//     int err;
+
+//     printk("Initializing SD card...\n");
+
+//     err = disk_access_init(disk_pdrv);
+//     if (err != 0) {
+//         printk("disk_access_init failed. Error code: %d\n", err);
+//         // gpio_pin_set(cs, SD_CS_PIN, 1);  // Release CS if error occurs
+//         return -1;
+//     }
+//     printk("disk_access_init success\n");
+
+//     if (disk_access_ioctl(disk_pdrv, DISK_IOCTL_GET_SECTOR_COUNT, &block_count)) {
+//         printk("Unable to get sector count\n");
+//         // gpio_pin_set(cs, SD_CS_PIN, 1);  // Release CS
+//         return -1;
+//     }
+
+//     if (disk_access_ioctl(disk_pdrv, DISK_IOCTL_GET_SECTOR_SIZE, &block_size)) {
+//         printk("Unable to get sector size\n");
+//         // gpio_pin_set(cs, SD_CS_PIN, 1);  // Release CS
+//         return -1;
+//     }
+
+//     memory_size_mb = (uint64_t)block_count * block_size / (1024 * 1024);
+//     printk("Memory Size (MB): %u\n", (uint32_t)memory_size_mb);
+
+//     // Mount filesystem
+//     mp.fs_data = &fat_fs;
+//     err = fs_mount(&mp);
+//     if (err) {
+//         printk("Error mounting fat_fs [%d]\n", err);
+//         // gpio_pin_set(cs, SD_CS_PIN, 1);  // Release CS
+//         return err;
+//     }
+
+//     printk("Disk mounted successfully!\n");
+
+//     // Pull CS HIGH after communication
+//     // gpio_pin_set(cs, SD_CS_PIN, 1);
+
+//     return 0;
+// }
+
+/* New variation of do_pdm_transfer for continuous streaming */
+// To write for electret
+
+
+/* ---------------------------------------------- Helper functions for sending of data ---------------------------------------------- */
+static void stream_imu_data()
+{
+    LOG_INF("Streaming IMU motion magnitude over BLE...");
+
+    size_t total_samples = IMU_index;  // IMU_index is how many samples we actually have
+    size_t offset = 0;
+
+    while (offset < total_samples) {
+        size_t send_size = MIN(CHUNK_SIZE, total_samples - offset);
+
+        int err;
+        do {
+            err = bt_nus_send(NULL, (uint8_t *)&imu_buf[offset], send_size * sizeof(imu_buf[0]));
+            if (err == -ENOMEM) {
+                k_sleep(K_MSEC(10));  // Retry if BLE buffer is full
+                LOG_WRN("BLE buffer full, retrying...");
+            } else if (err == -ENOTCONN) {
+                LOG_WRN("BLE disconnected, saving progress at sample %d", offset);
+                return;
+            } else if (err < 0) {
+                LOG_ERR("Failed to send BLE data, err: %d", err);
+                return;
+            }
+        } while (err == -ENOMEM);
+
+        offset += send_size;
+        k_sleep(K_MSEC(1));  // Small delay to prevent congestion
+    }
+
+    // Footer message
+    const char *footer_msg = "IMU\n";
+    bt_nus_send(NULL, footer_msg, strlen(footer_msg));
+
+    // Motion status footer -- removed flagging because we already passing the whole graph recorded
+    // if (motion_flag == 1){
+    //     const char *motion_msg = "High motion during recording\n";
+    //     bt_nus_send(NULL, motion_msg, strlen(motion_msg)); 
+    // } else {
+    //     const char *motion_msg = "No high motion during recording\n";
+    //     bt_nus_send(NULL, motion_msg, strlen(motion_msg)); 
+    // }
+
+    LOG_INF("IMU streaming complete.");
+}
+
+/* Send recorded buffer over BLE 
+    - Accomplished with sending of chunks of 200 bytes per sample, maxing the 247 MTU
+    - Sending both Audio and IMU consecutively one after the other
+*/
+static void stream_audio()
+{
+    // if (!record_ready) {
+    //     LOG_INF("No recording available.");
+    //     return;
+    // }
+    led_on(&green_led);
+    led_off(&blue_led);
+    LOG_INF("Streaming recorded audio over BLE...");
+
+    size_t total_samples = ARRAY_SIZE(electret_buf);
+    size_t offset = 0;
+
+    while (offset < total_samples) {
+        size_t send_size = MIN(CHUNK_SIZE, total_samples - offset);
+
+        int err;
+        do {
+            err = bt_nus_send(NULL, (int16_t *)&electret_buf[offset], send_size * sizeof(int16_t));
+            if (err == -ENOMEM) {
+                k_sleep(K_MSEC(10));  // Retry if BLE buffer is full
+                LOG_WRN("BLE buffer full, retrying...");
+            } else if (err == -ENOTCONN) {
+                LOG_WRN("BLE disconnected, saving progress at sample %d", offset);
+                // last_sent_index = offset;
+                return;
+            } else if (err < 0) {
+                LOG_ERR("Failed to send BLE data, err: %d", err);
+                return;
+            }
+        } while (err == -ENOMEM);
+
+        offset += send_size;
+        k_sleep(K_MSEC(1));  // Small delay to prevent congestion 10mS used initially - adjusted to 1mS
+    
+    }
+
+    // Send "finished" footer message
+    const char *footer_msg = "finished\n";
+    bt_nus_send(NULL, footer_msg, strlen(footer_msg));
+    
+    stream_imu_data(); // streams IMU data here : temporarily turned off until addition of Red
+
+    LOG_INF("Streaming complete.");
+    led_off(&green_led);
+    // last_sent_index = 0;  // Reset for next transmission
+}
+
+/* ---------------------------------------------- BLE NUS Callback - Handle received data ---------------------------------------------- */
+static void received(struct bt_conn *conn, const void *data, uint16_t len, void *ctx)
+{
+    printk("1");
+    char message[CONFIG_BT_L2CAP_TX_MTU + 1] = "";
+    printk("2");
+    ARG_UNUSED(conn);
+    ARG_UNUSED(ctx);
+    printk("3");
+    memcpy(message, data, MIN(sizeof(message) - 1, len));
+    message[len] = '\0';
+    printk("4");
+    printk("Received BLE command: %s", message);
+
+    // Start recording on receiving "rec" command
+    if (strncmp(message, "rec", 3) == 0 && !mic_recording) {
+        mic_recording = true;
+        mic_sample_index = 0;
+        IMU_index = 0;
+    }
+    // Send stored recording when "send" command is received
+    else if (strncmp(message, "send", 4) == 0) {
+        stream_audio(); // sends mic and IMU data
+    }
+    else if (strncmp(message, "imu", 3) == 0) {
+        stream_imu_data(); // sends only IMU data
+    }
+    else if (strcmp(message, "stop") == 0) {
+        // use this to set to manual mode aswell
+        mic_recording = false;
+        if (cont_mode){
+            cont_mode=false;
+            printk("Changing cont mode to false and sending remaining chunks and footer");
+            // Send any remaining samples (if less than CHUNK_SIZE)
+            if (cont_buf_index > 0) {
+                bt_nus_send(NULL, cont_buf, cont_buf_index * sizeof(int16_t));
+            }
+            // send footer message
+            const char *footer_msg = "finished\n";
+            bt_nus_send(NULL, footer_msg, strlen(footer_msg));
+        }
+        current_mode = MODE_MANUAL;
+        led_off(&red_led);
+        led_off(&green_led);
+        led_off(&blue_led);
+        printk("Received stop command.\nSwitching to Manual Mode.\n");
+    }
+    else if (strncmp(message, "manual", 6) == 0) {
+        mic_recording = false;
+        current_mode = MODE_MANUAL;
+        printk("Switched to manual mode\n");
+    } 
+    else if (strncmp(message, "auto", 4) == 0) {
+        current_mode = MODE_AUTO;
+        k_sem_give(&mode_sem); // Start auto loop
+        printk("Switched to auto mode\n");
+    } 
+    else if (strncmp(message, "cont", 4) == 0) {
+        current_mode = MODE_CONTINUOUS;
+        cont_mode = true;
+        k_sem_give(&mode_sem);
+        printk("Switched to continuous mode\n");
+        led_on(&red_led);
+        led_on(&green_led);
+        led_on(&blue_led);
+    } 
+    else {
+        current_mode = MODE_MANUAL;
+        if (cont_mode){
+            cont_mode=false;
+            printk("Changing cont mode to false and sending remaining chunks and footer");
+            // Send any remaining samples (if less than CHUNK_SIZE)
+            if (cont_buf_index > 0) {
+                bt_nus_send(NULL, cont_buf, cont_buf_index * sizeof(int16_t));
+            }
+            // send footer message
+            const char *footer_msg = "finished\n";
+            bt_nus_send(NULL, footer_msg, strlen(footer_msg));
+        }
+        mic_recording = false;
+        led_off(&red_led);
+        led_off(&green_led);
+        led_off(&blue_led);
+        printk("MTU= %d", bt_gatt_get_mtu(conn));
+        printk(" Received an unknown command, setting to manual mode.\n");
+        const char *unknown_command = "Unknown Command!\n";
+        if (bt_nus_send(NULL, unknown_command, strlen(unknown_command)) == 0) {
+            k_sleep(K_MSEC(100));  // Delay to prevent BLE flooding
+        } else {
+            LOG_ERR("Received unknown command but no active BLE connection.");
+        }
+    }
+}
+
+/* ---------------------------------------------- BLE Connection Callback ---------------------------------------------- */
+static void notif_enabled(bool enabled, void *ctx)
+{
+	ARG_UNUSED(ctx);
+
+	printk("%s() - %s\n", __func__, (enabled ? "Enabled" : "Disabled"));
+}
+
+struct bt_nus_cb nus_listener = {
+    .notif_enabled = notif_enabled,
+    .received = received,
+};
+
+static void disconnected(struct bt_conn *conn, uint8_t reason)
+{
+    LOG_WRN("Disconnected (reason %d), restarting advertising...", reason);
+
+    int err = bt_le_adv_start(BT_LE_ADV_CONN, ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
+    if (err) {
+        LOG_ERR("Failed to restart advertising (err %d)", err);
+    } else {
+        LOG_INF("Advertising restarted successfully.");
+    }
+}
+
+static struct bt_conn_cb conn_callbacks = {
+    .disconnected = disconnected,
+};
+
+// ---------------------------------------------- Main code starts here ---------------------------------------------- //
+int main(void)
+{
+    // Initializing Microphone    
+    if (!device_is_ready(adc_dev)) {
+        printk("ADC device not ready\n");
+        return;
+    }
+
+    if (adc_channel_setup(adc_dev, &adc_channel_mic) != 0) {
+        printk("Failed to setup ADC channel\n");
+        return;
+    }
+
+    // Note: created this here din baka may difference
+    struct adc_sequence sequence = {
+        .channels = BIT(ADC_CHANNEL_MIC),
+        .buffer = adc_sample_buffer,
+        .buffer_size = sizeof(adc_sample_buffer),
+        .resolution = ADC_RESOLUTION,
+    };
+
+    int err;
+    gpio_pin_configure_dt(&red_led, GPIO_OUTPUT_ACTIVE);
+    gpio_pin_configure_dt(&green_led, GPIO_OUTPUT_ACTIVE);
+    gpio_pin_configure_dt(&blue_led, GPIO_OUTPUT_ACTIVE);
+    bt_conn_cb_register(&conn_callbacks);
+    // Turn off LEDs
+    led_off(&red_led);
+    led_off(&green_led);
+    led_off(&blue_led);
+
+    // Initialize SPI device
+    // spi_dev = DEVICE_DT_GET(SPI_DEVICE_NODE);
+    // if (!device_is_ready(spi_dev)) {
+    //     printk("SPI device not ready\n");
+    //     return -1;
+    // } else {
+    //     printk("SPI initialization successful!\n");
+    // }
+    
+    // // Initialize SD card
+    // if (init_sd_card() != 0) {
+    //     printk("Failed to initialize SD card\n");
+    //     return -1;
+    // }
+
+    LOG_INF("Initializing Bluetooth...");
+
+    err = bt_nus_cb_register(&nus_listener, NULL);
+    if (err) {
+        LOG_ERR("Failed to register NUS callback: %d", err);
+        return err;
+    }
+
+    err = bt_enable(NULL);
+    if (err) {
+        LOG_ERR("Failed to enable Bluetooth: %d", err);
+        return err;
+    }
+
+    err = bt_le_adv_start(BT_LE_ADV_CONN_ONE_TIME, ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
+    if (err) {
+        LOG_ERR("Failed to start advertising: %d", err);
+        return err;
+    }
+
+    // printk("MTU= %d", bt_gatt_get_mtu(NULL)); // to add this on next build to see if naupdate yung MTU  
+
+    LOG_INF("Bluetooth initialized and advertising");
+
+    /* Portion for the IMU computation */ // running at priority level 5
+    start_imu_thread();
+    /* Portion for the MIC computation */ // running at priority level 5
+    start_mic_thread();
+
+    /* Main loop */
+    while (1) {
+        k_sleep(K_MSEC(100));
+
+        switch (current_mode) {
+            case MODE_MANUAL:
+                printk("Manual mode: waiting for external trigger\n");
+                k_sleep(K_SECONDS(1));  // Normal operation
+                break;
+    
+            case MODE_AUTO:
+                printk("Auto mode: recording and sending in a loop\n");
+                // This will continue on looping until the mode is set to auto
+                while (current_mode == MODE_AUTO) {
+                    // Start recording
+                    mic_recording = true;
+                    mic_sample_index = 0;
+                    IMU_index = 0;
+                    k_sleep(K_SECONDS(12));
+                    // send after doing PDM transfer ---------- //
+                    stream_audio();    // Send after recording
+                    k_sleep(K_SECONDS(12)); // we can configure this later on para sa frequency ng pagkuha ng heart rate 
+                }
+                break;
+    
+            case MODE_CONTINUOUS:
+                printk("Continuous mode: saving to SD card\n");
+                while (current_mode == MODE_CONTINUOUS) {
+                    cont_mode = true;
+                    // do nothing
+                }
+                break;
+        }
+    
+        k_sem_take(&mode_sem, K_FOREVER);  // Wait for mode change
+    }
+
+    return 0;
+}
+
+/*
+Changelog Documentation:
+-- Note will start listing changelog levels based on the revision of making use of an Electret microphone as opposed to using a PDM MEMS microphone.
+
+Build: no_IMU -- temporarily built to remove IMU for RED
+
+1.1: Changed mic thread priority to 4 -- trying to remove the humming in the recording (04-29-2025)
+ - didnt work changed back to 5, tried turning off IMU thread, still didnt work
+ - also tried having it staight connected from DC supply, it didnt work as well
+ - grounding the ADC input doesnt hum ?? idk if its hardware issue or code issue
+
+1.2: Will be changing the recording duration to 20 Seconds and Adding the "cont" mode (05-01-2025)
+ - might ignore IMU data in cont mode,,, this is so that we can process in sending chunk
+   - thinking we might not implement cont yet because initial implementations didn't work aswell, along with difficulty of having the IMU plotted
+     against it.
+   - the effectivity of the algorithm works bests for windowed samples, so having longer audio recording will just leverage on the fact that
+     we still have to divide the long audio recording (i.e 1 hour recording) into samples of small recordings
+ - NOTE: Cont mode is not working but we can record na in 20 Seconds durations for auto and manual
+ - made this so that you'll only change MIC_RECORD_DURATION_SECONDS and it will automatically adapt the buffer size for both IMU and MIC
+ - moved the elapsed computation to before the very first if statement in the while loop of the Mic Thread
+   - hoping this would remove the humming but still it didnt... 
+ - also removed the else statement and configured the LED indicators to work as expected:
+   - RED == recording in progress
+   - BLUE == Done recording, ready to be sent
+   - GREEN == Sending buffers
+   - OFF == usually idle or just after sending this will be the light mode
+   - WHITE == 'cont' mode, but this is for debate whether to continue or not...
+
+1.3: Changed yung sa part ng IMU (05-07-2025)
+ - initially hardcoded kasi yung part na if IMU == 1000 then IMU_recording false
+
+*/

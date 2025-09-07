@@ -1,0 +1,7 @@
+west:
+  command: C:\ncs\toolchains\b620d30767\opt\bin\Scripts\west build --build-dir c:/Users/lyled/CAREM1/no_IMU
+    c:/Users/lyled/CAREM1 --pristine --board xiao_ble/nrf52840/sense --no-sysbuild
+    -- -DNCS_TOOLCHAIN_VERSION=NONE -DCONF_FILE=prj.conf -DEXTRA_DTC_OVERLAY_FILE=boards/xiao_ble_nrf52840_sense.overlay
+    -DBOARD_ROOT=c:/users/lyled/dmic;c:/users/lyled/uart;c:/users/lyled/ble_mic;c:/users/lyled/blinky;c:/users/lyled/electret;c:/users/lyled/carem1
+  topdir: c:\ncs\v2.9.0
+  version: 1.2.0

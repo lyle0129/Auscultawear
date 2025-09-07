@@ -1,0 +1,12 @@
+Backend v1.0
+- Initial
+- Calculates HR from audio
+- Utilizes fixed threshold for HR 
+
+Backend v2.0
+- Improves HR by implementing moving/rolling threshold
+
+Backend v3.0
+- Adds RR calculation
+- Utilizes fixed threshold for RR
+- Utilizes moving/rolling area computation after envelope to detect RR and not HR

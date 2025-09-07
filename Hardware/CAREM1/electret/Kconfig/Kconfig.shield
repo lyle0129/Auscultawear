@@ -1,0 +1,7 @@
+osource "c:/users/lyled/dmic/boards/shields/*/Kconfig.shield"
+osource "c:/users/lyled/uart/boards/shields/*/Kconfig.shield"
+osource "c:/users/lyled/ble_mic/boards/shields/*/Kconfig.shield"
+osource "c:/users/lyled/blinky/boards/shields/*/Kconfig.shield"
+osource "c:/users/lyled/electret/boards/shields/*/Kconfig.shield"
+osource "c:/users/lyled/carem1/boards/shields/*/Kconfig.shield"
+osource "C:/ncs/v2.9.0/nrf/boards/shields/*/Kconfig.shield"

@@ -1,0 +1,56 @@
+cmake:
+  application:
+    configuration-dir: C:/Users/lyled/CAREM1
+    source-dir: C:/Users/lyled/CAREM1
+  board:
+    name: xiao_ble
+    qualifiers: nrf52840/sense
+    revision: 
+  devicetree:
+    bindings-dirs:
+     - C:/ncs/v2.9.0/nrf/dts/bindings
+     - C:/ncs/v2.9.0/zephyr/dts/bindings
+    extra-user-files:
+     - boards/xiao_ble_nrf52840_sense.overlay
+    files:
+     - C:/ncs/v2.9.0/zephyr/boards/seeed/xiao_ble/xiao_ble_nrf52840_sense.dts
+     - C:/Users/lyled/CAREM1/boards/xiao_ble_nrf52840_sense.overlay
+     - boards/xiao_ble_nrf52840_sense.overlay
+    include-dirs:
+     - C:/ncs/v2.9.0/nrf/include
+     - C:/ncs/v2.9.0/nrf/dts
+     - C:/ncs/v2.9.0/zephyr/include
+     - C:/ncs/v2.9.0/zephyr/include/zephyr
+     - C:/ncs/v2.9.0/zephyr/dts/common
+     - C:/ncs/v2.9.0/zephyr/dts/x86
+     - C:/ncs/v2.9.0/zephyr/dts/xtensa
+     - C:/ncs/v2.9.0/zephyr/dts/sparc
+     - C:/ncs/v2.9.0/zephyr/dts/riscv
+     - C:/ncs/v2.9.0/zephyr/dts/posix
+     - C:/ncs/v2.9.0/zephyr/dts/nios2
+     - C:/ncs/v2.9.0/zephyr/dts/arm64
+     - C:/ncs/v2.9.0/zephyr/dts/arm
+     - C:/ncs/v2.9.0/zephyr/dts/arc
+     - C:/ncs/v2.9.0/zephyr/dts
+    user-files:
+     - C:/Users/lyled/CAREM1/boards/xiao_ble_nrf52840_sense.overlay
+  kconfig:
+    files:
+     - C:/ncs/v2.9.0/zephyr/boards/seeed/xiao_ble/xiao_ble_nrf52840_sense_defconfig
+     - C:/Users/lyled/CAREM1/prj.conf
+    user-files:
+     - prj.conf
+  toolchain:
+    name: zephyr
+    path: C:/ncs/toolchains/b620d30767/opt/zephyr-sdk
+  vendor-specific:
+    nordic:
+      svdfile: C:/ncs/v2.9.0/modules/hal/nordic/nrfx/mdk/nrf52840.svd
+  zephyr:
+    version: 3.7.99
+    zephyr-base: C:/ncs/v2.9.0/zephyr
+version: 0.1.0
+west:
+  command: C:\ncs\toolchains\b620d30767\opt\bin\Scripts\west build --build-dir c:/Users/lyled/CAREM1/electret c:/Users/lyled/CAREM1 --pristine --board xiao_ble/nrf52840/sense --no-sysbuild -- -DNCS_TOOLCHAIN_VERSION=NONE -DCONF_FILE=prj.conf -DEXTRA_DTC_OVERLAY_FILE=boards/xiao_ble_nrf52840_sense.overlay -DBOARD_ROOT=c:/users/lyled/dmic;c:/users/lyled/uart;c:/users/lyled/ble_mic;c:/users/lyled/blinky;c:/users/lyled/electret;c:/users/lyled/carem1
+  topdir: c:\ncs\v2.9.0
+  version: 1.2.0

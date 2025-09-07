@@ -1,0 +1,2 @@
+# Load Zephyr board defconfig descriptions.
+osource "C:/ncs/v2.9.0/zephyr/boards/seeed/xiao_ble/Kconfig.defconfig"
